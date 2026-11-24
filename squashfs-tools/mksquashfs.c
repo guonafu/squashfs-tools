@@ -400,7 +400,7 @@ static void add_old_root_entry(char *name, squashfs_inode inode,
 	unsigned int inode_number, int type);
 static struct file_info *duplicate(int *dup, int *block_dup,
 	long long file_size, long long bytes, unsigned int *block_list,
-	struct file_buffer **buffer_list, long long start,
+	struct file_buffer **buffer_list, int buffer_start, long long start,
 	struct dir_ent *dir_ent, struct file_buffer *file_buffer, int blocks,
 	long long sparse, int bl_hash);
 static struct dir_info *dir_scan1(struct tree *, char *, char *, struct pathnames *,
@@ -1995,7 +1995,7 @@ static unsigned short get_checksum_disk(long long start, long long l,
 
 
 static unsigned short get_checksum_buffers(long long start, long long l,
-	unsigned int *blocks, struct file_buffer **buffers)
+	unsigned int *blocks, struct file_buffer **buffers, int buffer_start)
 {
 	long long dpos = -1;
 	unsigned short chksum = 0;
@@ -2006,8 +2006,8 @@ static unsigned short get_checksum_buffers(long long start, long long l,
 		bytes = squashfs_compressed_size_block(blocks[i]);
 		if(bytes == 0) /* sparse block */
 			continue;
-		if(buffers[i])
-			chksum = get_checksum(buffers[i]->data, bytes, chksum);
+		if(i >= buffer_start && buffers[i - buffer_start])
+			chksum = get_checksum(buffers[i - buffer_start]->data, bytes, chksum);
 		else {
 			struct file_buffer *write_buffer = queue_cache_lookup(bwriter_buffer, start);
 
@@ -2326,7 +2326,7 @@ static void reset_and_truncate(void)
 
 static struct file_info *duplicate(int *dupf, int *block_dup,
 	long long file_size, long long bytes, unsigned int *block_list,
-	struct file_buffer **buffer_list, long long start,
+	struct file_buffer **buffer_list, int buffer_start, long long start,
 	struct dir_ent *dir_ent, struct file_buffer *file_buffer, int blocks,
 	long long sparse, int bl_hash)
 {
@@ -2360,7 +2360,8 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 
 			/* Now get the checksums and compare */
 			if(checksum_flag == FALSE) {
-				checksum = get_checksum_buffers(start, bytes, block_list, buffer_list);
+				checksum = get_checksum_buffers(start, bytes, block_list,
+					buffer_list, buffer_start);
 				checksum_flag = TRUE;
 			}
 
@@ -2394,8 +2395,10 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
 				 * enough to hold the entire file, in which case
 				 * the block will have been written to disk.
 				 */
-				if(buffer_list[block])
-					target_data = buffer_list[block]->data;
+				if(block >= buffer_start &&
+						buffer_list[block - buffer_start])
+					target_data =
+						buffer_list[block - buffer_start]->data;
 				else {
 					target_buffer = queue_cache_lookup(bwriter_buffer, target_start);
 					if(target_buffer)
@@ -3017,18 +3020,32 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 	struct file_info *file;
 	int block_dup;
 	int cache_size = cache_maxsize(read_buffer);
+	int cached_blocks;
+
+	thresh = blocks > cache_size ? blocks - cache_size : 0;
+	cached_blocks = blocks - thresh;
 
 	block_list = MALLOC(blocks * sizeof(unsigned int));
-	buffer_list = MALLOC(blocks * sizeof(struct file_buffer *));
+	/*
+	 * Only the last cache_size blocks can still be held in the cache.
+	 * Blocks before thresh have already been written out, and are
+	 * represented by a NULL entry (and read back from disk when needed).
+	 * Allocate buffer_list for the cached blocks only, rather than for
+	 * every block in the file.  This matters for very large files, where
+	 * blocks * sizeof(struct file_buffer *) can be gigabytes.
+	 */
+	buffer_list = MALLOC((cached_blocks ? cached_blocks : 1) *
+		sizeof(struct file_buffer *));
+	memset(buffer_list, 0, (cached_blocks ? cached_blocks : 1) *
+		sizeof(struct file_buffer *));
 
 	file_bytes = 0;
 	mark_vpos();
-	thresh = blocks > cache_size ? blocks - cache_size : 0;
 
 	for(block = 0; block < blocks;) {
 		if(read_buffer->fragment) {
 			block_list[block] = 0;
-			buffer_list[block++] = NULL;
+			block ++;
 			fragment_buffer = read_buffer;
 			blocks = read_size >> block_log;
 			inc_progress_bar();
@@ -3037,10 +3054,12 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 				block_list[block] = read_buffer->c_byte;
 				file_bytes += read_buffer->size;
 				if(block < thresh) {
-					buffer_list[block++] = NULL;
+					block ++;
 					put_write_buffer_hash(read_buffer);
-				} else
-					buffer_list[block++] = read_buffer;
+				} else {
+					buffer_list[block - thresh] = read_buffer;
+					block ++;
+				}
 				inc_progress_bar();
 			} else {
 				int i;
@@ -3048,7 +3067,7 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 
 				for(i = 0; i < count; i++) {
 					block_list[block] = 0;
-					buffer_list[block++] = NULL;
+					block ++;
 					inc_progress_bar();
 				}
 				sparse += count * read_buffer->size;
@@ -3075,13 +3094,13 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 		sparse = 0;
 
 	file = duplicate(duplicate_file, &block_dup, read_size, file_bytes,
-		block_list, buffer_list, get_marked_vpos(), dir_ent,
+		block_list, buffer_list, thresh, get_marked_vpos(), dir_ent,
 		fragment_buffer, blocks, sparse, bl_hash);
 
 	if(block_dup == FALSE) {
 		for(block = thresh; block < blocks; block ++)
-			if(buffer_list[block])
-				put_write_buffer_hash(buffer_list[block]);
+			if(buffer_list[block - thresh])
+				put_write_buffer_hash(buffer_list[block - thresh]);
 
 		if(!is_vpos_marked()) {
 			send_orderer_create_map(get_marked_vpos());
@@ -3089,7 +3108,7 @@ static struct file_info *write_file_blocks_dup(int *status, struct dir_ent *dir_
 		}
 	} else {
 		for(block = thresh; block < blocks; block ++)
-			gen_cache_block_put(buffer_list[block]);
+			gen_cache_block_put(buffer_list[block - thresh]);
 	}
 
 	gen_cache_block_put(fragment_buffer);
@@ -3111,7 +3130,7 @@ read_err:
 	*status = read_buffer->error;
 	reset_and_truncate();
 	for(blocks = thresh; blocks < block; blocks ++)
-		gen_cache_block_put(buffer_list[blocks]);
+		gen_cache_block_put(buffer_list[blocks - thresh]);
 	free(buffer_list);
 	free(block_list);
 	gen_cache_block_put(read_buffer);
